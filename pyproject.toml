@@ -1,0 +1,34 @@
+[project]
+name = "iceberg-extractor-v2"
+version = "0.2.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Marcus Holanda", email = "mvsh777@hotmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+iceberg-extractor-v2 = "iceberg_extractor_v2:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "delta-spark==3.3.2",
+    "pyspark==3.5.8",
+    "ruff>=0.15.20",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+builtins = ["spark"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
