@@ -1,0 +1,17 @@
+{
+    "python.analysis.typeCheckingMode": "off",
+    "python.analysis.extraPaths": ["src", "lib", "resources"],
+    "python.analysis.diagnosticMode": "workspace",
+    "python.analysis.stubPath": ".vscode",
+    "python.analysis.ignore": ["*"],
+    
+    "ruff.importStrategy": "fromEnvironment",
+    "[python]": {
+        "editor.defaultFormatter": "charliermarsh.ruff",
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": {
+            "source.fixAll.ruff": "explicit",
+            "source.organizeImports.ruff": "explicit"
+        }
+    }
+}

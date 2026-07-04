@@ -1,14 +1,16 @@
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Set
+from typing import List, Optional, Set, Tuple
+
 import pyspark.sql.functions as F
-from pyspark.sql import SparkSession, DataFrame
+from delta.tables import DeltaTable
+from pyspark.sql import DataFrame, SparkSession
+
 from .exceptions import (
     CheckpointExpiredError,
     LineageBrokenError,
     UnsupportedFeatureError,
 )
-from delta.tables import DeltaTable
 
 logger = logging.getLogger("iceberg_incremental_reader")
 
@@ -79,40 +81,60 @@ class IcebergIncrementalReaderV2:
                 f"O caminho fornecido '{self.metadata_dir}' nao aponta para um bucket S3 valido."
             )
 
-        sc = self.spark.sparkContext
-        conf = sc._jsc.hadoopConfiguration()
-        Path_class = sc._gateway.jvm.org.apache.hadoop.fs.Path
-        path_object = Path_class(self.metadata_dir)
-        fs = path_object.getFileSystem(conf)
+        metadata_files: list[IcebergMetadataFile] = []
 
-        status_list = fs.listStatus(path_object)
-        if not status_list:
-            raise FileNotFoundError(
-                f"Nenhum arquivo de metadados encontrado em (s3): {self.metadata_dir}"
-            )
-
-        metadata_files = sorted(
-            map(
-                lambda status: IcebergMetadataFile(
-                    status.getPath().toString(), status.getModificationTime()
-                ),
-                filter(
-                    lambda status: (
-                        status.getPath().toString().endswith(".metadata.json")
+        try:
+            metadata_files = sorted(
+                map(
+                    lambda _: IcebergMetadataFile(_.path, _.modificationTime),
+                    filter(
+                        lambda _: _.name.endswith(".metadata.json"),
+                        dbutils.fs.ls(self.metadata_dir),  # noqa
                     ),
-                    status_list,
                 ),
-            ),
-            key=lambda meta: meta.modification_time,
-            reverse=True,
-        )
-
-        if not metadata_files:
-            raise FileNotFoundError(
-                f"Nenhum arquivo com a extensao '.metadata.json' foi localizado em {self.metadata_dir}"
+                key=lambda _: _.modification_time,
+                reverse=True,
             )
 
-        return metadata_files[0].path
+        except NameError:
+            logger.info(
+                "Ambiente sem dbutils detectado. Tentando acessar o S3 via Hadoop FileSystem."
+            )
+
+            sc = self.spark.sparkContext
+            conf = sc._jsc.hadoopConfiguration()
+            Path_class = sc._gateway.jvm.org.apache.hadoop.fs.Path
+            path_object = Path_class(self.metadata_dir)
+            fs = path_object.getFileSystem(conf)
+
+            status_list = fs.listStatus(path_object)
+            if not status_list:
+                raise FileNotFoundError(
+                    f"Nenhum arquivo de metadados encontrado em (s3): {self.metadata_dir}"
+                )
+
+            metadata_files = sorted(
+                map(
+                    lambda status: IcebergMetadataFile(
+                        status.getPath().toString(), status.getModificationTime()
+                    ),
+                    filter(
+                        lambda status: (
+                            status.getPath().toString().endswith(".metadata.json")
+                        ),
+                        status_list,
+                    ),
+                ),
+                key=lambda meta: meta.modification_time,
+                reverse=True,
+            )
+        finally:
+            if not metadata_files:
+                raise FileNotFoundError(
+                    f"Nenhum arquivo com a extensao '.metadata.json' foi localizado em {self.metadata_dir}"
+                )
+
+            return metadata_files[0].path
 
     def _build_snapshot_interval(
         self, checkpoint_id: int, current_id: int
