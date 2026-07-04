@@ -116,7 +116,7 @@ uv build
 
 ```
 
-O pacote compilado estará disponível em `dist/iceberg_incremental_reader_v2-0.2.0-py3-none-any.whl`.
+O pacote compilado estará disponível em `dist/iceberg_incremental_reader_v2-0.2.1-py3-none-any.whl`.
 
 ### 2. Detecção Dinâmica de Destino (Híbrida)
 

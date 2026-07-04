@@ -84,19 +84,29 @@ class IcebergIncrementalReaderV2:
         metadata_files: list[IcebergMetadataFile] = []
 
         try:
+            from databricks.sdk import WorkspaceClient
+
+            wsc = WorkspaceClient()
+            status_list = wsc.dbutils.fs.ls(self.metadata_dir)
+
+            if not status_list:
+                raise FileNotFoundError(
+                    f"Nenhum arquivo de metadados encontrado em (s3): {self.metadata_dir}"
+                )
+
             metadata_files = sorted(
                 map(
                     lambda _: IcebergMetadataFile(_.path, _.modificationTime),
                     filter(
                         lambda _: _.name.endswith(".metadata.json"),
-                        dbutils.fs.ls(self.metadata_dir),  # noqa
+                        status_list,
                     ),
                 ),
                 key=lambda _: _.modification_time,
                 reverse=True,
             )
 
-        except NameError:
+        except ImportError:
             logger.info(
                 "Ambiente sem dbutils detectado. Tentando acessar o S3 via Hadoop FileSystem."
             )
