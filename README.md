@@ -1,6 +1,7 @@
 # Iceberg to Delta Incremental Reader (V2)
 
-> **⚠️ AVISO DE ESCOPO E USO:** Este projeto foi desenvolvido **estritamente para fins de testes, estudo e desenvolvimento de habilidades pessoais em engenharia de dados**. Ele **NÃO é uma garantia de 100% de sucesso em produção** e deve ser encarado como uma Prova de Conceito (PoC) educacional e experimental.
+> [!WARNING]
+> **AVISO DE ESCOPO E USO:** Este projeto foi desenvolvido **estritamente para fins de testes, estudo e desenvolvimento de habilidades pessoais em engenharia de dados**. Ele **NÃO é uma garantia de 100% de sucesso em produção** e deve ser encarado como uma Prova de Conceito (PoC) educacional e experimental.
 
 ---
 
@@ -154,7 +155,7 @@ reader = IcebergIncrementalReaderV2(
 Antes de rodar, garanta que a evolução automática de esquema esteja ativa na sua sessão para permitir a absorção de mudanças de contrato da origem (*Schema Drift*):
 
 ```python
-from iceberg_incremental_reader import IcebergIncrementalReaderV2
+from iceberg_extractor_v2 import IcebergIncrementalReaderV2
 
 # Ativa a evolução automática exigida pelo Delta Lake
 spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
@@ -181,28 +182,3 @@ proximo_checkpoint = reader.sync(last_checkpoint_id=11111111111111111)
 * **`pyproject.toml`**: Metadados de compilação gerenciados pelo `uv` utilizando o backend `hatchling`.
 
 ---
-
-### 🧪 Validação em Cenário Crítico (Mutações Sequenciais no AWS Athena)
-
-Para homologar a resiliência do algoritmo de *Set Difference* contra a volatilidade de metadados, o motor foi submetido ao pior cenário de estresse lógico possível para pipelines incrementais de CDC: uma janela de processamento contendo múltiplas mutações e reestruturações físicas executadas consecutivamente pela engine do **AWS Athena**.
-
-O fluxo do teste seguiu rigorosamente a seguinte linha do tempo na tabela de origem:
-
-```
-[DELETE] ──> [UPDATE] ──> [OPTIMIZE] ──> [INSERT]
-
-```
-
-#### O Comportamento do Ecossistema:
-
-1. **`DELETE` e `UPDATE`:** Geraram arquivos de *Position Deletes* (`content=1`) apontando para registros específicos dentro dos Parquets de dados originais.
-2. **`OPTIMIZE`:** O Athena consolidou os dados remanescentes (vivos) em um arquivo Parquet com um nome (`_fp`) completamente inédito. Simultaneamente, por otimização de infraestrutura do próprio Athena, os metadados históricos e os marcadores de exclusão (`status=2`) dos arquivos antigos foram expirados/ocultados do manifesto do intervalo.
-3. **`INSERT`:** Injetou novas linhas de dados logo após a compactação terminar, criando mais um arquivo Parquet ativo na raiz.
-
-#### O Resultado da Sincronização V2:
-
-Ao disparar o método `sync()`, a variável de intervalo incremental de arquivos excluídos veio vazia da API de manifestos devido ao *Fast-Forward* do Athena.
-
-Contudo, o algoritmo da **V2** isolou o ruído da AWS executando a comparação morfológica entre as fotos do Checkpoint e do Snapshot Atual. O *Set Difference* identificou com precisão cirúrgica que os arquivos originais haviam sumido da fotografia ativa, disparando o `Merge` de exclusão no Delta destino antes que o Passo de inserção entrasse em ação.
-
-Os dados atualizados e as novas inserções foram consolidados no Delta **com sucesso absoluto e zero duplicações**, validando a robustez técnica do pacote para qualquer cenário real de concorrência.
