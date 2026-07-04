@@ -7,9 +7,9 @@
 
 ## 💡 Motivação e Contexto Técnico
 
-A inspiração para a criação deste motor surgiu de uma fricção crônica observada em ecossistemas modernos de Big Data: **a incapacidade ou limitação de plataformas como o Databricks em ler tabelas Apache Iceberg catalogadas no AWS Glue que possuíam arquivos de deleção ativos (*Row-Level Deletes*)**.
+A inspiração para o desenvolvimento deste motor surgiu de um desafio técnico crítico em ecossistemas modernos de Big Data: **a limitação do Databricks em ler tabelas Apache Iceberg catalogadas no AWS Glue que possuem arquivos de deleção ativos (*Row-Level Deletes*)**.
 
-Em arquiteturas que sofrem mutações constantes (como rotinas de `UPDATE` e `DELETE`), o Iceberg V2 gera arquivos secundários de deleção. No entanto, ao tentar consumir essas tabelas de dentro do Databricks **utilizando o recurso de Catálogo Federado (*Lakehouse Federation*) para mapear o catálogo externo do AWS Glue**, os conectores de mercado frequentemente falham em aplicar essas deleções lógicas, gerando inconsistências silenciosas na leitura.
+Em arquiteturas que sofrem mutações constantes (como rotinas de `UPDATE` e `DELETE`), o formato Iceberg V2 gera arquivos secundários de deleção. No entanto, ao tentar consumir essas tabelas de dentro do Databricks **utilizando o recurso de Catálogo Federado (*Lakehouse Federation*) para mapear o catálogo externo do AWS Glue**, essa camada de federação frequentemente falha em aplicar as deleções lógicas, gerando inconsistências silenciosas na leitura dos dados.
 
 ---
 
@@ -26,7 +26,7 @@ O leitor descarta intermediários e inspeciona de forma puramente técnica a inf
 
 ### 1. Descoberta Dinâmica de Metadados
 
-Ao ser instanciado, o construtor vasculha o diretório `/metadata/` da origem no S3 usando a API de `FileSystem` do Hadoop através do gateway JVM do PySpark. Ele identifica e decodifica o arquivo `.metadata.json` mais recente com base no carimbo de modificação física (`modification_time`), extraindo o ponteiro do snapshot ativo (`current-snapshot-id`) e o ID do esquema atual (`current-schema-id`).
+Ao ser instanciado, o construtor executa uma varredura adaptativa para localizar o arquivo de metadados mais recente no diretório `/metadata/` da origem no S3. O motor tenta, prioritariamente, utilizar a API nativa do **Databricks SDK (`WorkspaceClient`)** para listar os arquivos de forma segura e compatível com ambientes Serverless. Caso a execução ocorra em um ambiente local (onde o SDK não está disponível ou lança erro), o sistema aciona um mecanismo de *fallback* automático, instanciando a classe **`FileSystem` do Hadoop** através do gateway JVM do PySpark. A partir dessa listagem, o motor decodifica o arquivo `.metadata.json` mais recente com base no carimbo de modificação física (`modification_time`), extraindo dinamicamente o ponteiro do snapshot ativo (`current-snapshot-id`) e o ID do esquema atual (`current-schema-id`).
 
 ### 2. Carga Completa (Modo FULL)
 
