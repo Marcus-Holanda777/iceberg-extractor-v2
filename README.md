@@ -177,7 +177,11 @@ proximo_checkpoint = reader.sync(last_checkpoint_id=11111111111111111)
 
 ## 🗂️ Estrutura do Projeto
 
-* **`core_v2.py`**: Classe mestre contendo a lógica de varredura Hadoop, abstração dinâmica de caminhos S3, cálculo de morfologia por conjuntos e escrita transacional via comandos Delta.
+* **`exceptions.py`**: Exceções customizadas para isolamento de erros de linhagem (`CheckpointExpiredError`, `LineageBrokenError`, `UnsupportedFeatureError`).
+* **`pyproject.toml`**: Metadados de compilação gerenciados pelo `uv` utilizando o backend `hatchling`.
+* **`core.py`**: Classe mestre contendo a lógica de orquestração para leitura incremental e full, coordenando catalog e storage.
+* **`catalog.py`**: Responsável pela descoberta e leitura de metadados Iceberg, snapshots, manifests e cálculo de arquivos ativos por snapshot.
+* **`storage.py`**: Implementa a engine de persistência Delta, aplicando cargas completas e mutações incrementais (position deletes, expurgos por arquivos obsoletos e inserts).
 * **`exceptions.py`**: Exceções customizadas para isolamento de erros de linhagem (`CheckpointExpiredError`, `LineageBrokenError`, `UnsupportedFeatureError`).
 * **`pyproject.toml`**: Metadados de compilação gerenciados pelo `uv` utilizando o backend `hatchling`.
 

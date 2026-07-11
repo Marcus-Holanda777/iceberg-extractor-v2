@@ -1,151 +1,79 @@
+"""
+Modulo principal de orquestracao para leitura incremental e full de tabelas Apache Iceberg V2 para Delta.
+
+Este modulo implementa a logica central de sincronizacao de dados entre tabelas Apache Iceberg e
+um storage Delta. Ele funciona como uma fachada (Facade) que coordena multiplos componentes
+desacoplados para realizar operacoes de carga incremental e completa.
+
+Funcionalidades principais:
+    - Leitura de metadados brutos de tabelas Iceberg (table metadata)
+    - Extracao de informacoes de snapshot (versoes) da tabela
+    - Mapeamento dinamico de colunas baseado em schema IDs
+    - Deteccao de mudancas entre snapshots (incremental)
+    - Processamento de manifestos Avro para localizar arquivos fisicos
+    - Extracao de caminhos de dados e deletes posicionais de arquivos Parquet
+    - Tratamento de exclusoes logicas via delete files
+    - Deteccao de otimizacoes/compactacoes atraves de analise de set difference
+    - Sincronizacao inteligente com suporte a checkpoint para continuidade
+
+O pipeline segue estas etapas:
+    1. Coleta e validacao de metadados brutos
+    2. Mapeamento dinamico de colunas baseado no schema atual
+    3. Filtragem de manifestos relevantes (incremental ou full)
+    4. Extracao de caminhos fisicos de dados e deletes
+    5. Leitura e limpeza de arquivos Parquet
+    6. Aplicacao de filtros de delete files
+    7. Persistencia das alteracoes via camada de Storage
+
+"""
+
 import logging
-from dataclasses import dataclass
 from typing import List, Optional, Tuple
+
 import pyspark.sql.functions as F
 from pyspark.sql import SparkSession
-from .exceptions import (
-    CheckpointExpiredError,
-    LineageBrokenError,
-    UnsupportedFeatureError,
-)
-from delta.tables import DeltaTable
+
+from .catalog import IcebergCatalog
+from .exceptions import UnsupportedFeatureError
+from .storage import DeltaStorageEngine
+
+logger = logging.getLogger("iceberg_incremental_reader.core")
 
 
-logger = logging.getLogger("iceberg_incremental_reader")
-
-
-@dataclass
-class IcebergMetadataFile:
-    """Representa um arquivo de metadados do Iceberg com seu caminho e timestamp de modificacao."""
-
-    path: str
-    modification_time: int
-
-
-class IcebergIncrementalReader:
-    """Orquestrador de leitura incremental e full de tabelas Apache Iceberg V2."""
+class IcebergIncrementalReaderV2:
+    """Orquestrador (Facade) de leitura incremental e full de tabelas Apache Iceberg V2 para Delta."""
 
     def __init__(
         self, spark: SparkSession, table_directory_path: str, target_table: str
     ) -> None:
-        """Inicializa o leitor incremental desvendando os metadados dinamicamente.
+        """Inicializa o orquestrador de leitura incremental de tabelas Iceberg.
 
         Args:
-            spark: Instância ativa do SparkSession.
-            table_directory_path: Caminho base da tabela de origem no S3
-                (ex: 's3://bucket-name/tabela/').
-            target_table: Nome qualificado da tabela Iceberg destino.
+            spark: Sessão SparkSession ativa para operacoes distribuidas.
+            table_directory_path: Caminho do diretorio raiz da tabela Iceberg.
+            target_table: Nome ou caminho da tabela Delta destino.
         """
         self.spark = spark
-        self.target_table = target_table
-        self.table_path = table_directory_path.rstrip("/")
-        self.metadata_dir = f"{self.table_path}/metadata"
 
-        logger.info(f"Escaneando diretorio de metadados: {self.metadata_dir}")
-        self.metadata_path = self._discover_latest_metadata()
-        logger.info(f"Ultimo arquivo de metadados identificado: {self.metadata_path}")
-
-    def _discover_latest_metadata(self) -> str:
-        """Identifica o arquivo de metadados mais recente no diretorio S3 especificado.
-
-        Returns:
-            str: Caminho completo do arquivo de metadados mais recente.
-
-        Raises:
-            ValueError: Se o caminho fornecido nao for um bucket S3 valido.
-            FileNotFoundError: Se nenhum arquivo de metadados for encontrado.
-
-        """
-        if not self.metadata_dir.startswith(("s3://", "s3a://", "s3n://")):
-            raise ValueError(
-                f"O caminho fornecido '{self.metadata_dir}' nao aponta para um bucket S3 valido."
-            )
-
-        sc = self.spark.sparkContext
-        conf = sc._jsc.hadoopConfiguration()
-        Path_class = sc._gateway.jvm.org.apache.hadoop.fs.Path
-        path_object = Path_class(self.metadata_dir)
-        fs = path_object.getFileSystem(conf)
-
-        status_list = fs.listStatus(path_object)
-
-        if not status_list:
-            raise FileNotFoundError(
-                f"Nenhum arquivo de metadados encontrado em (s3): {self.metadata_dir}"
-            )
-
-        metadata_files = sorted(
-            map(
-                lambda status: IcebergMetadataFile(
-                    status.getPath().toString(), status.getModificationTime()
-                ),
-                filter(
-                    lambda status: (
-                        status.getPath().toString().endswith(".metadata.json")
-                    ),
-                    status_list,
-                ),
-            ),
-            key=lambda meta: meta.modification_time,
-            reverse=True,
-        )
-
-        if not metadata_files:
-            raise FileNotFoundError(
-                f"Nenhum arquivo com a extensao '.metadata.json' foi localizado em {self.metadata_dir}"
-            )
-
-        return metadata_files[0].path
-
-    def _build_snapshot_interval(
-        self, checkpoint_id: int, current_id: int
-    ) -> List[int]:
-        """Rastreia a arvore de snapshots do Iceberg do mais recente ao checkpoint."""
-        df_meta = self.spark.read.option("multiline", "true").json(self.metadata_path)
-
-        df_snapshots = df_meta.select(F.explode("snapshots").alias("snap")).select(
-            F.col("snap.snapshot-id").cast("long").alias("snapshot_id"),
-            F.col("snap.parent-snapshot-id").cast("long").alias("parent_id"),
-        )
-
-        snapshot_tree = {
-            row["snapshot_id"]: row["parent_id"] for row in df_snapshots.collect()
-        }
-
-        if checkpoint_id not in snapshot_tree and checkpoint_id != current_id:
-            raise CheckpointExpiredError(
-                f"O snapshot do checkpoint {checkpoint_id} expirou do histórico."
-            )
-
-        interval_ids: List[int] = []
-        cursor: Optional[int] = current_id
-        visited = set()
-
-        while cursor and cursor != checkpoint_id:
-            if cursor in visited:
-                raise LineageBrokenError(
-                    "Ciclo infinito detectado na linhagem de snapshots."
-                )
-            visited.add(cursor)
-            interval_ids.append(cursor)
-            cursor = snapshot_tree.get(cursor)
-
-        if cursor != checkpoint_id:
-            raise LineageBrokenError(
-                f"O checkpoint {checkpoint_id} nao é um ancestral linear de {current_id}."
-            )
-
-        list_interval_ids = list(reversed(interval_ids))
-        logger.info(
-            f"Snapshots a serem processados do checkpoint {checkpoint_id} até o atual {current_id}: {list_interval_ids}"
-        )
-
-        return list_interval_ids
+        # Componentes desacoplados injetados internamente
+        self.catalog = IcebergCatalog(spark, table_directory_path)
+        self.storage = DeltaStorageEngine(spark, target_table)
 
     def _extract_parquet_paths(
         self, manifest_entries_path: List[str], is_incremental: bool
-    ) -> Tuple[List[str], List[str], List[str]]:
-        """Analisa os arquivos Avro de manifesto coletando os caminhos fisicos dos Parquets por status."""
+    ) -> Tuple[List[str], List[str]]:
+        """Analisa os manifestos Avro coletando caminhos físicos de dados e deletes posicionais.
+
+        Args:
+            manifest_entries_path: Lista de caminhos dos arquivos de manifesto Avro.
+            is_incremental: Flag indicando se a leitura é incremental ou full.
+
+        Returns:
+            Tupla contendo (caminhos_dados, caminhos_deletes) com os arquivos Parquet identificados.
+
+        Raises:
+            UnsupportedFeatureError: Quando detectados Equality Deletes (content=2) na tabela.
+        """
         df_entries = self.spark.read.format("avro").load(manifest_entries_path)
 
         if df_entries.filter(F.col("data_file.content") == 2).count() > 0:
@@ -156,13 +84,11 @@ class IcebergIncrementalReader:
         if is_incremental:
             cond_data = (F.col("status") == 1) & (F.col("data_file.content") == 0)
             cond_delete = (F.col("status") == 1) & (F.col("data_file.content") == 1)
-            cond_removed = (F.col("status") == 2) & (F.col("data_file.content") == 0)
         else:
             cond_data = (F.col("status").isin(0, 1)) & (F.col("data_file.content") == 0)
             cond_delete = (F.col("status").isin(0, 1)) & (
                 F.col("data_file.content") == 1
             )
-            cond_removed = F.lit(False)
 
         def _collect_paths(condition: F.Column) -> List[str]:
             return [
@@ -173,49 +99,39 @@ class IcebergIncrementalReader:
                 .collect()
             ]
 
-        return (
-            _collect_paths(cond_data),
-            _collect_paths(cond_delete),
-            _collect_paths(cond_removed),
-        )
+        return _collect_paths(cond_data), _collect_paths(cond_delete)
 
     def sync(self, last_checkpoint_id: Optional[int] = None) -> int:
-        """Executa a sincronizacao entre as tabelas de Origem e Destino."""
-        df_meta_raw = self.spark.read.option("multiline", "true").json(
-            self.metadata_path
-        )
+        """Executa o pipeline completo de sincronizacao entre Iceberg e Delta.
 
-        meta_info = (
-            df_meta_raw.select(
-                F.col("current-snapshot-id").alias("current_snapshot_id"),
-                F.col("current-schema-id").alias("current_schema_id"),
-                F.explode("snapshots").alias("snap"),
-            )
-            .filter(F.col("current-snapshot-id") == F.col("snap.snapshot-id"))
-            .select(
-                F.col("current_snapshot_id"),
-                F.col("snap.manifest-list").alias("manifest_list_path"),
-                F.col("current_schema_id"),
-            )
-            .first()
-        )
+        Coordena todas as etapas do processo: coleta de metadados, mapeamento dinamico de colunas,
+        filtragem de manifestos, extracao de caminhos fisicos, leitura de arquivos Parquet,
+        aplicacao de filtros de delete files e persistencia das alteracoes.
 
+        Args:
+            last_checkpoint_id: ID do ultimo snapshot processado. Se None, executa full load.
+            Se fornecido, executa carga incremental a partir deste checkpoint.
+
+        Returns:
+            ID do snapshot atual processado (current_snapshot_id).
+
+        Raises:
+            UnsupportedFeatureError: Quando a tabela contem Equality Deletes não suportados.
+        """
+
+        df_meta_raw = self.catalog.load_raw_metadata()
+        meta_info = self.catalog.extract_meta_info(df_meta_raw)
+
+        current_snapshot_id = meta_info["current_snapshot_id"]
         avro_file = meta_info["manifest_list_path"]
-        current_snapshot_id = int(meta_info["current_snapshot_id"])
-        current_schema_id = int(meta_info["current_schema_id"])
+        current_schema_id = meta_info["current_schema_id"]
 
         if last_checkpoint_id and current_snapshot_id == last_checkpoint_id:
             logger.info("Nenhuma alteracao detectada na origem Iceberg.")
             return current_snapshot_id
 
-        col_rows = (
-            df_meta_raw.select(F.explode("schemas").alias("sch"))
-            .filter(F.col("sch.schema-id") == F.lit(current_schema_id))
-            .select(F.explode("sch.fields").alias("field"))
-            .select(F.col("field.name").alias("column_name"))
-            .collect()
-        )
-        col_final = [row["column_name"] for row in col_rows] + ["_fp", "_rid"]
+        columns = self.catalog.get_schema_columns(df_meta_raw, current_schema_id)
+        col_final = columns + ["_fp", "_rid"]
 
         is_incremental = last_checkpoint_id is not None
         df_manifests_base = (
@@ -224,14 +140,31 @@ class IcebergIncrementalReader:
             .filter(F.col("content").isin(0, 1))
         )
 
+        removed_paths = []
         if is_incremental:
             logger.info(f"Modo INCREMENTAL. Checkpoint base: {last_checkpoint_id}")
-            valid_ids = self._build_snapshot_interval(
-                last_checkpoint_id, current_snapshot_id
+            valid_ids = self.catalog.build_snapshot_interval(
+                df_meta_raw, last_checkpoint_id, current_snapshot_id
             )
             df_manifests = df_manifests_base.filter(
                 F.col("added_snapshot_id").isin(valid_ids)
             )
+
+            logger.info(
+                "Mapeando morfologia dos snapshots para detectar compactacoes/exclusoes..."
+            )
+            files_at_checkpoint = self.catalog.get_active_files_at_snapshot(
+                last_checkpoint_id, df_meta_raw
+            )
+            files_at_current = self.catalog.get_active_files_at_snapshot(
+                current_snapshot_id, df_meta_raw
+            )
+
+            removed_paths = list(files_at_checkpoint - files_at_current)
+            if removed_paths:
+                logger.info(
+                    f"Set Difference detectou {len(removed_paths)} arquivos removidos (Optimize/Exclusoes)."
+                )
         else:
             logger.info("Modo FULL.")
             df_manifests = df_manifests_base
@@ -243,11 +176,11 @@ class IcebergIncrementalReader:
             .collect()
         ]
 
-        if not manifest_paths and is_incremental:
-            logger.info("Nenhum manifesto modificado encontrado.")
+        if not manifest_paths and not removed_paths and is_incremental:
+            logger.info("Nenhuma modificacao pendente encontrada no intervalo.")
             return current_snapshot_id
 
-        data_paths, delete_paths, removed_paths = self._extract_parquet_paths(
+        data_paths, delete_paths = self._extract_parquet_paths(
             manifest_paths, is_incremental
         )
 
@@ -284,79 +217,12 @@ class IcebergIncrementalReader:
 
         if not is_incremental:
             if df_final_limpo is not None:
-                df_final_limpo.write.format("delta").mode("overwrite").save(
-                    self.target_table
-                )
+                self.storage.write_full_load(df_final_limpo)
                 logger.info("Tabela destino inicializada via carga FULL.")
         else:
-            df_target = DeltaTable.forPath(self.spark, self.target_table)
-            has_mutations = False
-
-            if delete_paths:
-                df_del_target = (
-                    self.spark.read.parquet(*delete_paths)
-                    .select(
-                        F.regexp_replace(
-                            F.col("file_path"), r"^s3[a-z0-9]*://", ""
-                        ).alias("_fp"),
-                        F.col("pos").cast("long").alias("_rid"),
-                    )
-                    .dropDuplicates(["_fp", "_rid"])
-                )
-
-                (
-                    df_target.alias("target")
-                    .merge(
-                        df_del_target.alias("source"),
-                        "target._fp = source._fp AND target._rid = source._rid",
-                    )
-                    .whenMatchedDelete()
-                    .execute()
-                )
-                logger.info("Position Deletes sincronizados com sucesso.")
-                has_mutations = True
-
-            if removed_paths:
-                logger.info(
-                    f"Removendo referências de {len(removed_paths)} arquivos otimizados."
-                )
-                norm_paths = [
-                    (
-                        p.replace("s3://", "")
-                        .replace("s3a://", "")
-                        .replace("s3n://", ""),
-                    )
-                    for p in removed_paths
-                ]
-
-                df_del_optimize = self.spark.createDataFrame(norm_paths, ["_fp"])
-                (
-                    df_target.alias("target")
-                    .merge(
-                        df_del_optimize.alias("source"),
-                        "target._fp = source._fp",
-                    )
-                    .whenMatchedDelete()
-                    .execute()
-                )
-
-                logger.info("Registros historicos orfaos limpos do DELTA destino.")
-                has_mutations = True
-
-            if df_final_limpo is not None:
-                (
-                    df_target.alias("target")
-                    .merge(
-                        df_final_limpo.alias("source"),
-                        "target._fp = source._fp AND target._rid = source._rid",
-                    )
-                    .whenNotMatchedInsertAll()
-                    .execute()
-                )
-
-                logger.info("Novos registros anexados com sucesso.")
-                has_mutations = True
-
+            has_mutations = self.storage.apply_incremental_mutations(
+                df_final_limpo, delete_paths, removed_paths
+            )
             if has_mutations:
                 logger.info(
                     f"Sincronizacao concluida com sucesso para o snapshot: {current_snapshot_id}"
